@@ -30,10 +30,6 @@ def run_measurement(
     mid = datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
     return_status = "all_fail"
     try:
-        data_container = Data(params["data"])
-        data_container.set_dims_from_sensor(sensor)
-        data_container.create_array()
-
         synchroniser.open()
         synchroniser.stop()
         synchroniser.load_sequence()
@@ -41,16 +37,43 @@ def run_measurement(
         sleep(0.1)
         sensor.open()
         sleep(0.5)
-        for itervalue in tqdm(range(iterator_size)):
-            dynamic_devices.next_dynamic_step()
+        while True:
+            # timestamp for this run
+            mid = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+            run_name = f"{params['experiment_type']}_{mid}"
+            print(f"\n=== Starting measurement: {run_name} ===")
+
+            data_container = Data(params["data"])
+            data_container.set_dims_from_sensor(sensor)
+            data_container.create_array()
+
+        
+            for itervalue in tqdm(range(iterator_size)):
+                dynamic_devices.next_dynamic_step()
+                sleep(0.1)
+                for avg in tqdm(
+                    range(int(params["averages"])), leave=itervalue == (iterator_size - 1)
+                ):
+                    sleep(float(params.get("sleep", 0)))
+                    data = sensor.acquire_data(synchroniser)
+                    data_container.update_data(data, itervalue, avg)
+            params["filename"] = params["experiment_type"] + "_" + mid
+            params["measurement_status"] = return_status
+            params["qupyt_version"] = qupyt_version
+
+            data_container.save(params["filename"])
+            with open(params["filename"] + ".yaml", "w", encoding="utf-8") as file:
+                yaml.dump(params, file)
+            del data_container
+            gc.collect()
+
+            cmd = input("\nPress Enter to repeat measurement, or 'q' + Enter to quit: ").strip().lower()
+            if cmd == "q":
+                print("Exiting measurement loop.")
+                break
+            synchroniser.stop()
+            synchroniser.run()
             sleep(0.1)
-            for avg in tqdm(
-                range(int(params["averages"])), leave=itervalue == (iterator_size - 1)
-            ):
-                sleep(float(params.get("sleep", 0)))
-                data = sensor.acquire_data(synchroniser)
-                data_container.update_data(data, itervalue, avg)
-        return_status = "success"
     except Exception as e:
         print(f"exc {e}")
         logging.exception("An error occured during the measurement!")
@@ -59,13 +82,5 @@ def run_measurement(
         sensor.close()
         synchroniser.close()
         print("sensor closed")
-        params["filename"] = params["experiment_type"] + "_" + mid
-        params["measurement_status"] = return_status
-        params["qupyt_version"] = qupyt_version
-
-        data_container.save(params["filename"])
-        with open(params["filename"] + ".yaml", "w", encoding="utf-8") as file:
-            yaml.dump(params, file)
-        del data_container
-        gc.collect()
+        return_status = "success"
     return return_status
