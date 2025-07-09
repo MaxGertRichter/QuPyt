@@ -73,6 +73,7 @@ def run_measurement(
                 break
             synchroniser.stop()
             synchroniser.run()
+            dynamic_devices._reset_step_counter()
             sleep(0.1)
     except Exception as e:
         print(f"exc {e}")
