@@ -7,7 +7,7 @@ from time import sleep
 from datetime import datetime
 from typing import Dict, Any
 import gc
-
+import numpy as np
 import yaml
 from tqdm import tqdm
 
@@ -67,27 +67,31 @@ def run_measurement(
             print(data_container.data.shape)
 
             # --- Real-time plotting ---
-            # data_container.data shape: (2, N, 1, 1)
-            data_to_plot = data_container.data[:, :, 0, 0]  # shape: (2, N)
+            # data_container.data shape: (2, N, 1, 1) depending whether it is dynamic steps or not
+            data_to_plot = data_container.data[:, 0, :, 0]  # shape: (2, N)
+            data_to_plot = data_to_plot[:,2:]
             x = range(data_to_plot.shape[1])
             ax.clear()
-            ax.plot(x, data_to_plot[0], label="Series 1")
-            ax.plot(x, data_to_plot[1], label="Series 2")
+            ax.plot(x, data_to_plot[0], label="Reference")
+            ax.plot(x, data_to_plot[1], label="Measurement")
             ax.set_title(f"Measurement: {run_name}")
             ax.legend()
             plt.draw()
             plt.pause(0.01)
 
             # --- Ratio plotting ---
+            light_level = np.average(data_to_plot[0]) * 1e1
             ratio = data_to_plot[1] / data_to_plot[0]
+            contrast = np.min(ratio)
             ax_ratio.clear()
-            ax_ratio.plot(x, ratio, label="Ratio (Series 2 / Series 1)")
-            ax_ratio.set_title(f"Ratio: {run_name}")
+            ax_ratio.plot(x, ratio, label="Ratio (Measurement/Reference)")
+            ax_ratio.set_title(f"Ratio: {run_name}"+ f", Light level: {light_level:.1f} mV, Contrast: {contrast:.4f}")
             ax_ratio.legend()
             fig_ratio.canvas.draw()
             plt.pause(0.01)
             # --- End plotting ---
 
+            # don't save data for now when we run in continous mode
             #data_container.save(params["filename"])
             #with open(params["filename"] + ".yaml", "w", encoding="utf-8") as file:
             #    yaml.dump(params, file)
