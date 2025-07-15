@@ -28,8 +28,7 @@ def run_measurement(
     import matplotlib.pyplot as plt
     import msvcrt
     plt.ion()
-    fig, ax = plt.subplots()
-    fig_ratio, ax_ratio = plt.subplots()
+    fig, (ax, ax_ratio) = plt.subplots(nrows=1, ncols=2, figsize=(12, 5))
     static_devices.set_all_params()
     iterator_size = int(params.get("dynamic_steps", 1))
     mid = datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
@@ -67,43 +66,48 @@ def run_measurement(
             print(data_container.data.shape)
 
             # --- Real-time plotting ---
-            # data_container.data shape: (2, N, 1, 1) depending whether it is dynamic steps or not
-            data_to_plot = data_container.data[:, 0, :, 0]  # shape: (2, N)
-            data_to_plot = data_to_plot[:,2:]
-            x = range(data_to_plot.shape[1])
+            # data_container.data shape: (2, N, 1, 1) depending whether it is dynamic steps or not  # shape: (2, 1,N,1)+
+            data_to_plot = data_container.data
+            n_meas = params["sensor"]["config"]["number_measurements"]
+            ref = data_to_plot[0].flatten()/(n_meas/2)
+            mess = data_to_plot[1].flatten()/(n_meas/2)
+            N_dyn = int(params['dynamic_steps'])
+            min_f = float(params['dynamic_devices']['mw_source']['config']['frequency'][0]) /1e9
+            max_f = float(params['dynamic_devices']['mw_source']['config']['frequency'][1]) /1e9
+            step  = (max_f - min_f)/N_dyn
+            x_ESR = np.arange(min_f, max_f - step/2, step)
             ax.clear()
-            ax.plot(x, data_to_plot[0], label="Reference")
-            ax.plot(x, data_to_plot[1], label="Measurement")
+            ax.plot(x_ESR, ref, label="Reference")
+            ax.plot(x_ESR, mess, label="Measurement")
             ax.set_title(f"Measurement: {run_name}")
             ax.legend()
-            plt.draw()
+            fig.canvas.draw()
             plt.pause(0.01)
 
             # --- Ratio plotting ---
-            light_level = np.average(data_to_plot[0]) * 1e1
-            ratio = data_to_plot[1] / data_to_plot[0]
+            av = params["averages"]
+            light_level = np.average(ref)/av * 1e3
+            ratio = mess / ref
             contrast = np.min(ratio)
             ax_ratio.clear()
-            ax_ratio.plot(x, ratio, label="Ratio (Measurement/Reference)")
+            ax_ratio.plot(x_ESR, ratio, label="Ratio (Measurement/Reference)")
             ax_ratio.set_title(f"Ratio: {run_name}"+ f", Light level: {light_level:.1f} mV, Contrast: {contrast:.4f}")
             ax_ratio.legend()
-            fig_ratio.canvas.draw()
+            fig.canvas.draw()
             plt.pause(0.01)
             # --- End plotting ---
 
-            # don't save data for now when we run in continous mode
-            #data_container.save(params["filename"])
-            #with open(params["filename"] + ".yaml", "w", encoding="utf-8") as file:
-            #    yaml.dump(params, file)
-            del data_container
-            gc.collect()
-
-            # Check for keypress to exit
-            if msvcrt.kbhit():
-                key = msvcrt.getch()
-                if key.lower() == b'q':
-                    print("Exiting measurement loop.")
-                    break
+            # Wait for user to press Enter to continue or 'q' to quit
+            cmd = input("Press Enter to run the next measurement, Press 's' to save data and run the next measurement, or 'q' + Enter to quit: ").strip().lower()
+            if cmd == "s":
+                data_container.save(params["filename"])
+                with open(params["filename"] + ".yaml", "w", encoding="utf-8") as file:
+                    yaml.dump(params, file)
+                del data_container
+                gc.collect()
+            if cmd == "q":
+                print("Exiting measurement loop.")
+                break
             synchroniser.stop()
             synchroniser.run()
             dynamic_devices._reset_step_counter()
