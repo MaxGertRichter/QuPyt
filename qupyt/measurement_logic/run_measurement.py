@@ -28,8 +28,7 @@ def run_measurement(
     import matplotlib.pyplot as plt
     import msvcrt
     plt.ion()
-    fig, ax = plt.subplots()
-    fig_ratio, ax_ratio = plt.subplots()
+    fig, (ax, ax_ratio) = plt.subplots(nrows=1, ncols=2, figsize=(12, 5))
     static_devices.set_all_params()
     iterator_size = int(params.get("dynamic_steps", 1))
     mid = datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
@@ -68,26 +67,39 @@ def run_measurement(
 
             # --- Real-time plotting ---
             # data_container.data shape: (2, N, 1, 1) depending whether it is dynamic steps or not
-            data_to_plot = data_container.data[:, 0, :, 0]  # shape: (2, N)
-            data_to_plot = data_to_plot[:,2:]
-            x = range(data_to_plot.shape[1])
-            ax.clear()
-            ax.plot(x, data_to_plot[0], label="Reference")
-            ax.plot(x, data_to_plot[1], label="Measurement")
-            ax.set_title(f"Measurement: {run_name}")
-            ax.legend()
-            plt.draw()
-            plt.pause(0.01)
+            data_to_plot = data_container.data
 
+            rabi_steps = params["sensor"]["config"]["number_measurements"]
+            av = params["averages"]
+            rabi_list= []
+            for i in range(0, rabi_steps, 2): 
+                rabi_list.append(i)
+            x = np.array(rabi_list) * 2
+
+            mask = x>=4
+            x = x[mask] # cutting off the first 4 datapoints, this depends on the setup
+            ref = data_to_plot[0].flatten()/av
+            ref = ref[mask]  # cutting off the first 4 datapoints, this depends on the setup
+            mess = data_to_plot[1].flatten()/av
+            mess = mess[mask]  # cutting off the first 4 datapoints, this depends on the setup
+            light_level = np.average(ref)* 1e3
+            ax.clear()
+            ax.plot(x, ref, label="Reference")
+            ax.plot(x, mess, label="Measurement")
+            ax.set_title("Measurements")
+            ax.set_xlabel("t (ns)")
+            ax.legend()
             # --- Ratio plotting ---
-            light_level = np.average(data_to_plot[0]) * 1e1
-            ratio = data_to_plot[1] / data_to_plot[0]
+            ratio = mess/ref
             contrast = np.min(ratio)
             ax_ratio.clear()
             ax_ratio.plot(x, ratio, label="Ratio (Measurement/Reference)")
-            ax_ratio.set_title(f"Ratio: {run_name}"+ f", Light level: {light_level:.1f} mV, Contrast: {contrast:.4f}")
+            ax_ratio.set_title("Ratio")
+            ax_ratio.set_xlabel("t (ns)")
             ax_ratio.legend()
-            fig_ratio.canvas.draw()
+            # --- Figure title ---
+            fig.suptitle(f"File: {params['filename']} | Light level: {light_level:.1f} mV | Contrast: {contrast:.4f}")
+            fig.canvas.draw()
             plt.pause(0.01)
             # --- End plotting ---
 
