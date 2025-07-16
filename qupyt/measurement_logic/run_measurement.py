@@ -25,6 +25,11 @@ def run_measurement(
     synchroniser: Synchroniser,
     params: Dict[str, Any],
 ) -> str:
+    import matplotlib.pyplot as plt
+    import msvcrt
+    plt.ion()
+    fig = plt.figure(figsize=(6, 5))
+    ax = fig.add_subplot(1, 1, 1)
     static_devices.set_all_params()
     iterator_size = int(params.get("dynamic_steps", 1))
     mid = datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
@@ -44,9 +49,10 @@ def run_measurement(
             print(f"\n=== Starting measurement: {run_name} ===")
 
             data_container = Data(params["data"])
+            #data_container._set_reference_channels(1)
             data_container.set_dims_from_sensor(sensor)
             data_container.create_array()
-
+            print("Shape at creation of data container: "+str(data_container.data.shape))
         
             for itervalue in tqdm(range(iterator_size)):
                 dynamic_devices.next_dynamic_step()
@@ -60,14 +66,27 @@ def run_measurement(
             params["filename"] = params["experiment_type"] + "_" + mid
             params["measurement_status"] = return_status
             params["qupyt_version"] = qupyt_version
+    
+            plot_num = data_container.data.shape[0]
+            data_to_plot = data_container.data
+            print("Shape of data to plot: "+str(data_to_plot.shape))
+            # --- Plotting ---
+            
+            ax.clear()
+            for i in range(plot_num):
+                ax.plot(data_to_plot[i].flatten(), label=f"Plot {i}")
+            ax.legend()
+            ax.set_title(f"Measurement: {run_name}")
+            fig.canvas.draw()
+            plt.pause(0.01)
 
-            data_container.save(params["filename"])
-            with open(params["filename"] + ".yaml", "w", encoding="utf-8") as file:
-                yaml.dump(params, file)
-            del data_container
-            gc.collect()
-
-            cmd = input("\nPress Enter to repeat measurement, or 'q' + Enter to quit: ").strip().lower()
+            cmd = input("\nPress Enter to repeat measurement, 's' to save data and run the next measurement, or 'q' + Enter to quit: ").strip().lower()
+            if cmd == "s":
+                data_container.save(params["filename"])
+                with open(params["filename"] + ".yaml", "w", encoding="utf-8") as file:
+                    yaml.dump(params, file)
+                del data_container
+                gc.collect()
             if cmd == "q":
                 print("Exiting measurement loop.")
                 break
