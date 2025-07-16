@@ -107,15 +107,21 @@ def run_measurement(
             #data_container.save(params["filename"])
             #with open(params["filename"] + ".yaml", "w", encoding="utf-8") as file:
             #    yaml.dump(params, file)
-            del data_container
-            gc.collect()
+            
 
             # Check for keypress to exit
             if msvcrt.kbhit():
                 key = msvcrt.getch()
                 if key.lower() == b'q':
-                    print("Exiting measurement loop.")
+                    data_container.save(params["filename"])
+                    with open(params["filename"] + ".yaml", "w", encoding="utf-8") as file:
+                        yaml.dump(params, file)
+                    del data_container
+                    gc.collect()
+                    print("Exiting measurement loop and saving data.")
                     break
+            del data_container
+            gc.collect()
             synchroniser.stop()
             synchroniser.run()
             dynamic_devices._reset_step_counter()
