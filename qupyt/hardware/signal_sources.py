@@ -70,7 +70,7 @@ class DeviceFactory:
             "Mock",
             "SRS",
             "SMB",
-            "SMA"
+            "SMA",
             "Rigol",
             "TekAWG",
             "TekAFG",
@@ -99,7 +99,7 @@ class DeviceFactory:
                     device_info["config"],
                 )
             if device_info["device_type"] == "SMA":
-                return SMBVisaSignalSource(
+                return SMAVisaSignalSource(
                     device_info["address"],
                     device_info["device_type"],
                     device_info["config"],
@@ -441,7 +441,7 @@ class SMAVisaSignalSource(VisaSignalSource):
         self.opc_wait()
         self.instance.write("SOURce:FREQ:MODE LIST")
         self.opc_wait()
-        logging.info("%s[done]", "SMB set slist values.".ljust(65, "."))
+        logging.info("%s[done]", "SMA set slist values.".ljust(65, "."))
 
 
 
