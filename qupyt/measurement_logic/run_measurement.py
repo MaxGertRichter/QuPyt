@@ -41,6 +41,8 @@ def run_measurement(
         sleep(0.1)
         sensor.open()
         sleep(0.5)
+        params["filename"] = params["experiment_type"] + "_" + mid
+        data_container.set_filename((params["experiment_type"],mid))
         for itervalue in tqdm(range(iterator_size)):
             dynamic_devices.next_dynamic_step()
             sleep(0.1)
@@ -59,11 +61,10 @@ def run_measurement(
         sensor.close()
         synchroniser.close()
         print("sensor closed")
-        params["filename"] = params["experiment_type"] + "_" + mid
         params["measurement_status"] = return_status
         params["qupyt_version"] = qupyt_version
-
-        data_container.save(params["filename"])
+        if data_container.save_in_chunks == 0:
+            data_container.save(params["filename"])
         with open(params["filename"] + ".yaml", "w", encoding="utf-8") as file:
             yaml.dump(params, file)
         del data_container
