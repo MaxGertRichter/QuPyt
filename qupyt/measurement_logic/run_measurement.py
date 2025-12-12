@@ -16,6 +16,8 @@ from qupyt.measurement_logic.data_handling import Data
 from qupyt.hardware.synchronisers import Synchroniser
 from qupyt.hardware.sensors import Sensor
 from qupyt._version import __version__ as qupyt_version
+from evaluation_package import casr as casr
+from evaluation_package import utils as ut
 
 
 def run_measurement(
@@ -28,7 +30,7 @@ def run_measurement(
     import matplotlib.pyplot as plt
     import msvcrt
     plt.ion()
-    fig, (ax, ax_ratio) = plt.subplots(nrows=1, ncols=2, figsize=(12, 5))
+    fig, ((ax, ax_ratio), (ax_ref, ax_mess)) = plt.subplots(nrows=2, ncols=2, figsize=(12, 10))
     static_devices.set_all_params()
     iterator_size = int(params.get("dynamic_steps", 1))
     mid = datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
@@ -63,42 +65,108 @@ def run_measurement(
             params["filename"] = params["experiment_type"] + "_" + mid
             params["measurement_status"] = return_status
             params["qupyt_version"] = qupyt_version
-            print(data_container.data.shape)
 
             # --- Real-time plotting ---
             # data_container.data shape: (2, N, 1, 1) depending whether it is dynamic steps or not
-            data_to_plot = data_container.data
-
+            data = data_container.data
+            contrast = data[1].flatten() - data[0].flatten()
+            #contrast = ut.contrast(data)
             rabi_steps = params["sensor"]["config"]["number_measurements"]
             av = params["averages"]
-            rabi_list= []
-            for i in range(0, rabi_steps, 2): 
-                rabi_list.append(i)
-            x = np.array(rabi_list) * 2
 
-            mask = x>=4
-            x = x[mask] # cutting off the first 4 datapoints, this depends on the setup
-            ref = data_to_plot[0].flatten()/av
-            ref = ref[mask]  # cutting off the first 4 datapoints, this depends on the setup
-            mess = data_to_plot[1].flatten()/av
-            mess = mess[mask]  # cutting off the first 4 datapoints, this depends on the setup
-            light_level = np.average(ref)* 1e3
+            ref = data[0].flatten()/av
+
+            mess = data[1].flatten()/av
+            mask_index = 20
+            frequencies = casr.calc_fourier_frequencies(params)[mask_index:]
+            fft_spectrum = casr.calc_fourier_transform(params,data)[mask_index:]
+            prominence = np.median(fft_spectrum) * 5
+            mask, peak_info = casr.noise_only_mask(frequencies, fft_spectrum, prominence=prominence, rel_pad=10, width_hz=1)
+            idx, freq, amp = casr.find_peak_near(frequencies, fft_spectrum, 500)
+            sensitivity, snr, std = casr.calc_sensitivity(params, data, window_hz=50, return_snr=True, prominence=prominence)
+
             ax.clear()
-            ax.plot(x, ref, label="Reference")
-            ax.plot(x, mess, label="Measurement")
+            ax.plot(ref, label="Reference")
+            ax.plot(mess, label="Measurement")
             ax.set_title("Measurements")
             ax.set_xlabel("t (ns)")
             ax.legend()
             # --- Ratio plotting ---
-            ratio = mess/ref
-            contrast = np.min(ratio)
             ax_ratio.clear()
-            ax_ratio.plot(x, ratio, label="Ratio (Measurement/Reference)")
-            ax_ratio.set_title("Ratio")
-            ax_ratio.set_xlabel("t (ns)")
+            ax_ratio.plot(frequencies,fft_spectrum, label="CASR Spectrum")
+            ax_ratio.plot(
+                freq, amp, "ro",
+                label=(
+                    f"Calibration signal at {freq:.1f} Hz\n"
+                    f"with 10nT amplitude,\n"
+                    f"SNR={snr:.1f},\n"
+                    f"std={std:.3e},\n"
+                    f"sensitivity={sensitivity*1e12:.1f} pT/√Hz, \n"
+                )
+            )
+            ax_ratio.plot(frequencies[mask], fft_spectrum[mask], label="noise")
+            ax_ratio.set_title("CASR Spectrum")
+            ax_ratio.set_xlabel("Frequency [Hz]")
+            ax_ratio.set_ylabel("FFT amplitude [a.u.]")
             ax_ratio.legend()
+            
+            # --- Reference spectrum plotting ---
+            data0_ref = data[0].flatten()
+            fft_spectrum0_ref = casr.calc_fourier_transform(params, data0_ref, contrast=False)[mask_index:]
+            prominence_ref = np.median(fft_spectrum0_ref) * 5
+            mask_ref, peak_info_ref = casr.noise_only_mask(frequencies, fft_spectrum0_ref, prominence=prominence_ref, rel_pad=10, width_hz=1)
+            idx_ref, freq_ref, amp_ref = casr.find_peak_near(frequencies, fft_spectrum0_ref, 500)
+            sensitivity_ref, snr_ref, std_ref = casr.calc_sensitivity(params, data0_ref, window_hz=50, return_snr=True, prominence=prominence_ref, contrast=False)
+            sensitivity_ref = sensitivity_ref * 1/np.sqrt(2)
+            
+            ax_ref.clear()
+            ax_ref.plot(frequencies, fft_spectrum0_ref)
+            ax_ref.plot(
+                freq_ref, amp_ref, "ro",
+                label=(
+                    f"Calibration signal at {freq_ref:.1f} Hz\n"
+                    f"with 10nT amplitude,\n"
+                    f"SNR={snr_ref:.1f},\n"
+                    f"std={std_ref:.3e},\n"
+                    f"sensitivity={sensitivity_ref*1e12:.1f} pT/√Hz"
+                )
+            )
+            ax_ref.plot(frequencies[mask_ref], fft_spectrum0_ref[mask_ref], label="noise")
+            ax_ref.set_title("Reference Spectrum")
+            ax_ref.set_xlabel("Frequency [Hz]")
+            ax_ref.set_ylabel("FFT amplitude [a.u.]")
+            ax_ref.legend()
+            
+            # --- Measurement spectrum plotting ---
+            data0_mess = data[1].flatten()
+            fft_spectrum0_mess = casr.calc_fourier_transform(params, data0_mess, contrast=False)[mask_index:]
+            prominence_mess = np.median(fft_spectrum0_mess) * 5
+            mask_mess, peak_info_mess = casr.noise_only_mask(frequencies, fft_spectrum0_mess, prominence=prominence_mess, rel_pad=10, width_hz=1)
+            idx_mess, freq_mess, amp_mess = casr.find_peak_near(frequencies, fft_spectrum0_mess, 500)
+            sensitivity_mess, snr_mess, std_mess = casr.calc_sensitivity(params, data0_mess, window_hz=50, return_snr=True, prominence=prominence_mess, contrast=False)
+            sensitivity_mess = sensitivity_mess * 1/np.sqrt(2)
+            
+            ax_mess.clear()
+            ax_mess.plot(frequencies, fft_spectrum0_mess)
+            ax_mess.plot(
+                freq_mess, amp_mess, "ro",
+                label=(
+                    f"Calibration signal at {freq_mess:.1f} Hz\n"
+                    f"with 10nT amplitude,\n"
+                    f"SNR={snr_mess:.1f},\n"
+                    f"std={std_mess:.3e},\n"
+                    f"sensitivity={sensitivity_mess*1e12:.1f} pT/√Hz"
+                )
+            )
+            ax_mess.plot(frequencies[mask_mess], fft_spectrum0_mess[mask_mess], label="noise")
+            ax_mess.set_title("Measurement Spectrum")
+            ax_mess.set_xlabel("Frequency [Hz]")
+            ax_mess.set_ylabel("FFT amplitude [a.u.]")
+            ax_mess.legend()
+            
             # --- Figure title ---
-            fig.suptitle(f"File: {params['filename']} | Light level: {light_level:.1f} mV | Contrast: {contrast:.4f}")
+            fig.suptitle(f"File: {params['filename']}")
+            fig.tight_layout()
             fig.canvas.draw()
             plt.pause(0.01)
             # --- End plotting ---
