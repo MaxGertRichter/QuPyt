@@ -16,7 +16,7 @@ from qupyt.measurement_logic.data_handling import Data
 from qupyt.hardware.synchronisers import Synchroniser
 from qupyt.hardware.sensors import Sensor
 from qupyt._version import __version__ as qupyt_version
-
+from evaluation_package.rabi import microwave_list
 
 def run_measurement(
     static_devices: DeviceHandler,
@@ -71,17 +71,13 @@ def run_measurement(
 
             rabi_steps = params["sensor"]["config"]["number_measurements"]
             av = params["averages"]
-            rabi_list= []
-            for i in range(0, rabi_steps, 2): 
-                rabi_list.append(i)
-            x = np.array(rabi_list) * 2
-
-            mask = x>=4
-            x = x[mask] # cutting off the first 4 datapoints, this depends on the setup
+            x = np.array(microwave_list(params))*1e3  # in ns
+            mask_index = 2
+            x = x[mask_index:] # cutting off the first 4 datapoints, this depends on the setup
             ref = data_to_plot[0].flatten()/av
-            ref = ref[mask]  # cutting off the first 4 datapoints, this depends on the setup
+            ref = ref[mask_index:]  # cutting off the first 4 datapoints, this depends on the setup
             mess = data_to_plot[1].flatten()/av
-            mess = mess[mask]  # cutting off the first 4 datapoints, this depends on the setup
+            mess = mess[mask_index:]  # cutting off the first 4 datapoints, this depends on the setup
             light_level = np.average(ref)* 1e3
             ax.clear()
             ax.plot(x, ref, label="Reference")
@@ -92,13 +88,15 @@ def run_measurement(
             # --- Ratio plotting ---
             ratio = mess/ref
             contrast = np.min(ratio)
+            i_contrat = np.argmin(ratio)
+            rabi_duration = x[i_contrat]
             ax_ratio.clear()
             ax_ratio.plot(x, ratio, label="Ratio (Measurement/Reference)")
             ax_ratio.set_title("Ratio")
             ax_ratio.set_xlabel("t (ns)")
             ax_ratio.legend()
             # --- Figure title ---
-            fig.suptitle(f"File: {params['filename']} | Light level: {light_level:.1f} mV | Contrast: {contrast:.4f}")
+            fig.suptitle(f"File: {params['filename']} | Light level: {light_level:.1f} mV | Contrast: {contrast:.4f} | Rabi duration: {rabi_duration:.1f} ns")
             fig.canvas.draw()
             plt.pause(0.01)
             # --- End plotting ---
