@@ -77,14 +77,16 @@ def run_measurement(
             ref = data[0].flatten()/av
 
             mess = data[1].flatten()/av
-            mask_index = 20
+            mask_index = 5
             frequencies = casr.calc_fourier_frequencies(params)[mask_index:]
             fft_spectrum = casr.calc_fourier_transform(params,data)[mask_index:]
+            print("Fourier sepctrum calculation successful")
             prominence = np.median(fft_spectrum) * 5
             mask, peak_info = casr.noise_only_mask(frequencies, fft_spectrum, prominence=prominence, rel_pad=10, width_hz=1)
             idx, freq, amp = casr.find_peak_near(frequencies, fft_spectrum, 500)
-            sensitivity, snr, std = casr.calc_sensitivity(params, data, window_hz=50, return_snr=True, prominence=prominence)
-
+            print("mask calculation successful and peak fouund")
+            sensitivity, snr, std = casr.calc_sensitivity(params, data, window_hz=50, return_snr=True, prominence=prominence, mode = "only_calibration_peak", mask_index = 5)
+            print("first sensitivity calculation:", sensitivity)
             ax.clear()
             ax.plot(ref, label="Reference")
             ax.plot(mess, label="Measurement")
@@ -116,8 +118,7 @@ def run_measurement(
             prominence_ref = np.median(fft_spectrum0_ref) * 5
             mask_ref, peak_info_ref = casr.noise_only_mask(frequencies, fft_spectrum0_ref, prominence=prominence_ref, rel_pad=10, width_hz=1)
             idx_ref, freq_ref, amp_ref = casr.find_peak_near(frequencies, fft_spectrum0_ref, 500)
-            sensitivity_ref, snr_ref, std_ref = casr.calc_sensitivity(params, data0_ref, window_hz=50, return_snr=True, prominence=prominence_ref, contrast=False)
-            sensitivity_ref = sensitivity_ref * 1/np.sqrt(2)
+            sensitivity_ref, snr_ref, std_ref = casr.calc_sensitivity(params, data0_ref, window_hz=50, return_snr=True, prominence=prominence_ref, contrast=False, mode = "only_calibration_peak", mask_index = 5)
             
             ax_ref.clear()
             ax_ref.plot(frequencies, fft_spectrum0_ref)
@@ -143,8 +144,7 @@ def run_measurement(
             prominence_mess = np.median(fft_spectrum0_mess) * 5
             mask_mess, peak_info_mess = casr.noise_only_mask(frequencies, fft_spectrum0_mess, prominence=prominence_mess, rel_pad=10, width_hz=1)
             idx_mess, freq_mess, amp_mess = casr.find_peak_near(frequencies, fft_spectrum0_mess, 500)
-            sensitivity_mess, snr_mess, std_mess = casr.calc_sensitivity(params, data0_mess, window_hz=50, return_snr=True, prominence=prominence_mess, contrast=False)
-            sensitivity_mess = sensitivity_mess * 1/np.sqrt(2)
+            sensitivity_mess, snr_mess, std_mess = casr.calc_sensitivity(params, data0_mess, window_hz=50, return_snr=True, prominence=prominence_mess, contrast=False, mode = "only_calibration_peak", mask_index = 5)
             
             ax_mess.clear()
             ax_mess.plot(frequencies, fft_spectrum0_mess)
