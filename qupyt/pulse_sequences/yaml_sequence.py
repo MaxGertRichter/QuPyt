@@ -177,7 +177,6 @@ class ComplexSequence:
             raise RuntimeError(f"phase_block was not initialized.")
 
         self.phases = initial_phase + list(phase_block) * n + final_phase
-        print(self.phases)
         return None
 
 
