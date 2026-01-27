@@ -1,7 +1,7 @@
 """
 Generation of yaml file based pulse sequences.
 """
-
+import re
 from typing import Dict, Any, Optional
 import yaml
 from qupyt import set_up
@@ -116,28 +116,70 @@ class ComplexSequence:
         """Generates a list of phases for a given sequence type.
         Args:
             seq_type (str, optional): Sequence type. Defaults to 'XY8'.
-            n (int, optional): Number of repetitions of single block of
+            n (int, optional): Number of repetitions of each single block of
             chosen sequence type. Defaults to 8.
             readout_phase (float, optional): Phase of readout pulse.
             Defaults to np.pi/2 (sine magnetometry).
             Set to 0 for cosine magnetometry.
         Returns:
             Nothing. "phases" attribute is set.
+        Comments:
+            Here N is the number of pi-pulses per block. It is also used to
+            calculate the phases in the UD sequence.
         """
-        supported_seq_types = ["XY8"]
-        if seq_type not in supported_seq_types:
-            raise ValueError(
-                "Sequence type {} not supported.\
-                Currently only {} are supported".format(
-                    seq_type, supported_seq_types
-                )
-            )
-        if seq_type == "XY8":
-            initial_phase = [0.0]
-            final_phase = [readout_phase]
-            xy8_phases = [0, np.pi / 2, 0, np.pi / 2, np.pi / 2, 0, np.pi / 2, 0]
-            self.phases = initial_phase + xy8_phases * n + final_phase
-            return None
+
+        match = re.fullmatch(r"([A-Za-z]+)(\d+)", seq_type)
+        if not match:
+            raise ValueError(f"Invalid sequence type: {seq_type}")
+
+        seq_name, N = match.groups()
+        seq_name = seq_name.upper() # convert to uppercase letters
+        N = int(N) # convert N to integer
+
+        initial_phase = [0.0]
+        final_phase = [readout_phase]
+
+        if seq_name == "XY":
+
+            # base: XY4 block
+            phase_block = [0, np.pi / 2, 0, np.pi / 2]
+
+            # build XY-N block: XY_{2N} = XY_N + reverse(XY_N)
+            while len(phase_block) < N:
+                phase_block = phase_block + phase_block[::-1]
+
+            # XY only defined for N = 4 * 2^k
+            if len(phase_block) != N:
+                raise ValueError(f"Invalid XY lenght: {N}. N must be 4, 8, 16, 32, ...")
+
+
+        elif seq_name == "UD": # From: Supplemental material to Arbitrarily accurate pulse sequences for robust dynamical decoupling
+
+            phase_block = []
+
+            # Determine phase increment
+            if N % 4 == 0:
+                phi_ud = np.pi / (N / 4)
+            elif N % 4 == 2 and N != 2:
+                phi_ud = (np.pi * (N - 2) / 2) / (((N - 2) / 2 ) + 1)
+            else:
+                raise ValueError(f"Invalid ud length. The value has to be even and four or higher.")
+
+            # Generate quadratic phases
+            if phi_ud is not None:
+                for k in range(N):
+                    phase_block.append(((k * (k + 1)) / 2 * phi_ud) % (2 * np.pi))
+
+        else:
+            raise ValueError(f"Unsupported sequence family: {seq_type}")
+
+        if phase_block is None:
+            raise RuntimeError(f"phase_block was not initialized.")
+
+        self.phases = initial_phase + list(phase_block) * n + final_phase
+        print(self.phases)
+        return None
+
 
     def write_sequence(self, start: float = 0) -> None:
         """Iterates over phases attibute and appends
