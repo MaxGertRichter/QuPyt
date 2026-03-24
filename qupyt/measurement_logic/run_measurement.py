@@ -76,6 +76,8 @@ def run_measurement(
             max_f = float(params['dynamic_devices']['mw_source']['config']['frequency'][1]) /1e9
             step  = (max_f - min_f)/N_dyn
             x_ESR = np.arange(min_f, max_f - step/2, step)
+
+            
             ax.clear()
             ax.plot(x_ESR, ref, label="Reference")
             ax.plot(x_ESR, mess, label="Measurement")
@@ -89,9 +91,10 @@ def run_measurement(
             light_level = np.average(ref)/av * 1e3
             ratio = mess / ref
             contrast = np.min(ratio)
+            min_freq = x_ESR[np.argmin(ratio)]
             ax_ratio.clear()
             ax_ratio.plot(x_ESR, ratio, label="Ratio (Measurement/Reference)")
-            ax_ratio.set_title(f"Ratio: {run_name}"+ f", Light level: {light_level:.1f} mV, Contrast: {contrast:.4f}")
+            ax_ratio.set_title(f"f = {min_freq:.4f} GHz, Light level: {light_level:.1f} mV, Contrast: {contrast:.4f}")
             ax_ratio.legend()
             fig.canvas.draw()
             plt.pause(0.01)
