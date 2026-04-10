@@ -16,6 +16,7 @@ from qupyt.measurement_logic.data_handling import Data
 from qupyt.hardware.synchronisers import Synchroniser
 from qupyt.hardware.sensors import Sensor
 from qupyt._version import __version__ as qupyt_version
+from qupyt.set_up import get_seq_dir
 
 
 def run_measurement(
@@ -27,6 +28,7 @@ def run_measurement(
 ) -> str:
     static_devices.set_all_params()
     iterator_size = int(params.get("dynamic_steps", 1))
+    ps_iterator_size = int(params.get("pulse_sequence_steps", 1))
     mid = datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
     return_status = "all_fail"
     try:
@@ -34,22 +36,26 @@ def run_measurement(
         data_container.set_dims_from_sensor(sensor)
         data_container.create_array()
 
-        synchroniser.open()
-        synchroniser.stop()
-        synchroniser.load_sequence()
-        synchroniser.run()
-        sleep(0.1)
-        sensor.open()
-        sleep(0.5)
-        for itervalue in tqdm(range(iterator_size)):
-            dynamic_devices.next_dynamic_step()
+        for ps_itervalue in tqdm(range(ps_iterator_size)):
+            synchroniser.open()
+            synchroniser.stop()
+            synchroniser.load_sequence(get_seq_dir() / f"sequence_{ps_itervalue}.yaml")
+            synchroniser.run()
             sleep(0.1)
-            for avg in tqdm(
-                range(int(params["averages"])), leave=itervalue == (iterator_size - 1)
-            ):
-                sleep(float(params.get("sleep", 0)))
-                data = sensor.acquire_data(synchroniser)
-                data_container.update_data(data, itervalue, avg)
+            sensor.open()
+            sleep(0.5)
+            for itervalue in tqdm(range(iterator_size), leave=(ps_itervalue == ps_iterator_size - 1)):
+                dynamic_devices.next_dynamic_step()
+                sleep(0.1)
+                for avg in tqdm(
+                        range(int(params["averages"])),
+                        leave=(itervalue == (iterator_size - 1)) and (ps_itervalue == (ps_iterator_size - 1)),
+                ):
+
+                    sleep(float(params.get("sleep", 0)))
+                    data = sensor.acquire_data(synchroniser)
+                    data_container.update_data(data, ps_itervalue, itervalue, avg)
+            dynamic_devices.current_dynamic_step = 0
         return_status = "success"
     except Exception as e:
         print(f"exc {e}")
