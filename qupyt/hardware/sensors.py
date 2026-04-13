@@ -14,6 +14,11 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, List
 import ctypes
 
+import socket # for connection for GageDAQ
+import struct # for packing and unpacking data for GageDAQ
+import pickle
+
+
 import numpy as np
 from pypylon import pylon
 from harvesters.core import Harvester
@@ -117,6 +122,8 @@ class SensorFactory:
                 return HeliCam(configuration)
             if sensor_type == "DAQ":
                 return DAQ(configuration)
+            if sensor_type == "GageDAQ":
+                return GageDAQ(configuration)
             if sensor_type == "MockCam":
                 return MockCam(configuration)
             raise ValueError(
@@ -1140,6 +1147,150 @@ class DAQ(Sensor):
         """
         self.daq_task.close()
         logging.info("DAQ closed".ljust(65, "."))
+
+class GageDAQ(Sensor):
+    """
+    This class interfaces with GaGe Data Acquisition (DAQ) units via a TCP bridge.
+    It specifically focuses on devices controlled through the PyGage SDK, which
+    runs in a separate Python 3.9 process.
+
+    Communication with the hardware is handled via a local TCP socket connection
+    to a dedicated DAQ server. This design allows integration of the GaGe hardware
+    into QuPyt despite binary compatibility limitations of the PyGage library.
+
+    Arguments:
+        - **configuration** (dict): Configuration dictionary. Keys will be used
+        to select setter methods from an attribute map dictionary to set
+        associated values.
+
+        Possible configuration values:
+            - **number_measurements** (int): Number of measurement repetitions
+            handled by QuPyt. Each acquisition returns one trace.
+            - **host** (str): IP address of the DAQ server. Default is "127.0.0.1".
+            The server is expected to run locally on the same machine.
+            - **port** (int): TCP port used for communication with the DAQ server.
+            Default is 5001.
+            - **samples_per_trace** (int): Number of samples acquired per trace.
+            This defines the length of the returned data array.
+            - **timeout** (float): Optional timeout (in seconds) for socket
+            communication with the DAQ server.
+            - **trigger_mode** (str): Selects trigger behaviour ("auto", "external").
+
+        Note that these configuration attributes extend those from the
+        :class:`Sensor` base class.
+
+    The sensor returns data as a NumPy array with shape (1, samples_per_trace).
+    A running DAQ server process is required for operation.
+    """
+
+    def __init__(self, configuration: Dict[str, Any]) -> None:
+        super().__init__(configuration)
+
+        self.type: str = "GageDAQ"
+
+        # Connection to server
+        self.host = "127.0.0.1"
+        self.port = 5001
+
+        # Measurement parameters
+        self.samples_per_trace = 8192 # or N * 8192 
+        self.timeout = 5.0
+        self.trigger_mode = "channel"
+
+        # Data format
+        self.roi_shape = [self.samples_per_trace]
+        self.target_data_type = np.float64
+
+        # YAML → Setter mapping
+        self.attribute_map["host"] = self._set_host
+        self.attribute_map["port"] = self._set_port
+        self.attribute_map["samples_per_trace"] = self._set_samples
+        self.attribute_map["timeout"] = self._set_timeout
+        self.attribute_map["trigger_mode"] = self._set_trigger_mode
+
+        if configuration is not None:
+            self._update_from_configuration(configuration)
+
+
+    def _set_host(self, host: str) -> None:
+        self.host = host
+
+    def _set_port(self, port: int) -> None:
+        self.port = int(port)
+
+    def _set_samples(self, samples: int) -> None:
+        self.samples_per_trace = int(samples)
+        self.roi_shape = [self.samples_per_trace]
+
+    def _set_timeout(self, timeout: float) -> None:
+        self.timeout = float(timeout)
+
+    def _set_trigger_mode(self, trigger_mode: str) -> None:
+        self.trigger_mode = str(trigger_mode)
+
+    # network communication methods
+    def _send_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        payload = pickle.dumps(request)
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.connect((self.host, self.port))
+
+            # Länge senden
+            sock.sendall(struct.pack("!I", len(payload)))
+            sock.sendall(payload)
+
+            # Antwort empfangen
+            header = self._recv_exact(sock, 4)
+            msg_len = struct.unpack("!I", header)[0]
+
+            response_payload = self._recv_exact(sock, msg_len)
+
+        return pickle.loads(response_payload)
+
+    def _recv_exact(self, sock: socket.socket, n: int) -> bytes:
+        data = b""
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            if not chunk:
+                raise ConnectionError("Connection lost")
+            data += chunk
+        return data
+
+    # QuPyt interface methods
+    def open(self) -> None:
+        """Check connection to server"""
+        response = self._send_request({"command": "ping"})
+        if response.get("status") != "ok":
+            raise RuntimeError(f"GageDAQ server not reachable: {response}")
+        print("GageDAQ.open() called")
+
+    def acquire_data(self, synchroniser: Optional[Synchroniser] = None) -> np.ndarray:
+        """Main acquisition function"""
+        print("GageDAQ.acquire_data() called")
+        if synchroniser is not None:
+            synchroniser.trigger()
+
+        response = self._send_request(
+            {
+                "command": "acquire",
+                "samples_per_trace": self.samples_per_trace,
+                "timeout_s": self.timeout,
+                "trigger_mode": self.trigger_mode,
+            }
+        )
+
+        if response.get("status") != "ok":
+            raise RuntimeError(f"DAQ error: {response}")
+
+        data = np.frombuffer(response["data"], dtype=np.float64)
+
+        # wichtig für QuPyt!
+        data = data.reshape((1, -1))
+
+        return data
+
+    def close(self) -> None:
+        pass
 
 
 class MockCam(Sensor):
