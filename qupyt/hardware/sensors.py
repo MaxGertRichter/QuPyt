@@ -1274,6 +1274,7 @@ class GageDAQ(Sensor):
             {
                 "command": "acquire",
                 "samples_per_trace": self.samples_per_trace,
+                "number_measurements": self.number_measurements,
                 "timeout_s": self.timeout,
                 "trigger_mode": self.trigger_mode,
             }
@@ -1283,9 +1284,14 @@ class GageDAQ(Sensor):
             raise RuntimeError(f"DAQ error: {response}")
 
         data = np.frombuffer(response["data"], dtype=np.float64)
+        
+        print(">>> raw shape from server:", data.shape)
 
-        # wichtig für QuPyt!
-        data = data.reshape((1, -1))
+        print(">>> target shape:", tuple(response["shape"]))
+
+        data = data.reshape(tuple(response["shape"]))
+
+        print(">>> final sensor shape:", data.shape)
 
         return data
 
