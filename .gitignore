@@ -26,3 +26,4 @@ UNKNOWN.egg-info/
 qupyt.egg-info/
 sample_yamls/
 # Ignore auto-generated version file
+qupyt/_version.py
