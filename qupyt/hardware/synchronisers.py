@@ -9,6 +9,7 @@ import logging
 import pickle
 from time import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Dict, Tuple, List, Union
 from pathlib import Path
 import sys
@@ -41,6 +42,23 @@ except (ImportError, NameError):
         "Could not load spinapi library".ljust(65, ".")
         + "[failed]\nIf you are not using a Pulse Streamer you do not need this!"
     )
+
+
+AWG_MAX_SEQUENCE_STEPS = 16_384
+AWG_MAX_STEP_REPEAT = 1_048_576
+
+
+@dataclass(frozen=True)
+class AWGSequenceStep:
+    """One expanded logical AWG sequencer step.
+
+    Repeated-child compression must compare all hardware-visible state, not just
+    waveform names; repeat counts and flag states are part of the timing contract.
+    """
+
+    waveform: str
+    repeat: int
+    flags: tuple[str, ...]
 
 
 class SynchroniserFactory:
@@ -193,6 +211,7 @@ class AWGenerator(VisaObject, Synchroniser):
         self.wavenames: list[str]
         self.seqrepeats: list[int]
         self.waveform_block: np.ndarray
+        self.sequence_options: Dict[str, Any] = {}
         self.analog_amplitude: float = 1.0
         self.marker_amplitude: float = 1.75
         self.dac_resolution: int = 12
@@ -207,6 +226,7 @@ class AWGenerator(VisaObject, Synchroniser):
             self._update_from_configuration(configuration)
         VisaObject.__init__(self, self.address, self.device_type)
         self.instance.timeout = 20000
+        self._limit_channels_to_available_outputs()
 
     def _extract_flags(self, channel_mapping: Dict[str, Union[int, str]]) -> list[str]:
         return [
@@ -216,6 +236,7 @@ class AWGenerator(VisaObject, Synchroniser):
         ]
 
     def open(self) -> None:
+        self._limit_channels_to_available_outputs()
         self._configure()
 
     def close(self) -> None:
@@ -238,14 +259,19 @@ class AWGenerator(VisaObject, Synchroniser):
         logging.info("Sent trigger to AWG".ljust(65, ".") + "[done]")
 
     def load_sequence(self, ps_yaml_file: str = "sequence_0.yaml") -> None:
+        self._limit_channels_to_available_outputs()
         self.stop()
+        self.instance.write("*CLS")
         self._clear_awg()
+        self.sequence_options = self._load_awg_sequence_options(ps_yaml_file)
         sequence_translator = PulseSequenceYaml(
             self.channel_mapping, self.channels, samprate=self.samprate, yaml_file = ps_yaml_file)
         sequence_translator.translate_yaml_to_numeric_instructions()
         self._load_sequence_block(get_seq_dir() / "sequence.npz")
         self._upload_waveforms()
+        self._raise_on_awg_errors("waveform upload")
         self._sequence("autoseq", nongatereps=1)
+        self._raise_on_awg_errors("sequencer construction")
         logging.info(
             "Loaded and sequenced current pulse sequence".ljust(
                 65, ".") + "[done]"
@@ -281,70 +307,344 @@ class AWGenerator(VisaObject, Synchroniser):
         self.opc_wait()
 
     def _sequence(self, seqname: str, nongatereps: int = 1) -> None:
+        mode = self._get_awg_sequence_mode()
+        logical_steps = self._get_logical_awg_steps()
+        if mode == "flat":
+            self._sequence_flat(seqname, logical_steps, nongatereps=nongatereps)
+            return
+        if mode == "repeated_child":
+            self._sequence_repeated_child(
+                seqname, logical_steps, nongatereps=nongatereps
+            )
+            return
+        raise ValueError(
+            f"Unsupported awg_sequence_mode: {mode!r}. Supported values are "
+            "'flat' and 'repeated_child'."
+        )
+
+    def _sequence_flat(
+        self, seqname: str, logical_steps: list[AWGSequenceStep], nongatereps: int = 1
+    ) -> None:
+        if len(logical_steps) > AWG_MAX_SEQUENCE_STEPS:
+            raise ValueError(
+                f"Expanded AWG sequence has {len(logical_steps)} steps, exceeding "
+                f"the AWG70000B limit of {AWG_MAX_SEQUENCE_STEPS}. Enable "
+                "awg_sequence_mode: repeated_child or reduce the sequence."
+        )
+        print(f"Tek AWG sequence mode: flat\nLogical steps: {len(logical_steps)}")
         print("Setting up sequencer".ljust(65, "."), end="")
-        for channel in self.channels:
-            self.instance.write(f'slist:sequence:delete "sub_{channel}"')
-            self.instance.write(
-                f'slist:sequence:new "sub_{channel}",{len(self.wavenames)},1'
-            )
-            self.instance.write(
-                f'slist:sequence:event:jtiming "sub_{channel}" immediate'
-            )
-            for i, wavename in enumerate(self.wavenames):
-                self.instance.write(
-                    f'slist:sequence:step{i+1}:rcount "sub_{channel}",{self.seqrepeats[i]}'
-                )
-                self.instance.write(
-                    f'slist:sequence:step{i+1}:tasset1:waveform "sub_{channel}","{wavename}_{channel}"'
+        # AWG70K sequence assets have one or more tracks. Each active AWG output
+        # is assigned one track of the same sequence asset via SOURCE:CASS.
+        tracks = len(self.channels)
+        self.instance.write(f'slist:sequence:delete "sub"')
+        self.instance.write(f'slist:sequence:new "sub",{len(logical_steps)},{tracks}')
+        self.instance.write(f'slist:sequence:event:jtiming "sub", immediate')
+        for i, step in enumerate(logical_steps, start=1):
+            for track, channel in enumerate(self.channels, start=1):
+                self._configure_waveform_step(
+                    "sub", i, step, channel, track, set_flags=(track == 1)
                 )
 
-                for flag_channel in self.flag_channels:
-                    if flag_channel in self.flag_values[wavename]:
-                        self.instance.write(
-                            f'slist:sequence:step{i+1}:tflag1:{flag_channel}flag "sub_{channel}",HIGH'
-                        )
-                    else:
-                        self.instance.write(
-                            f'slist:sequence:step{i+1}:tflag1:{flag_channel}flag "sub_{channel}",LOW'
-                        )
+        self.instance.write(f'slist:sequence:delete "{seqname}"')
+        self.instance.write(f'slist:sequence:new "{seqname}",2,{tracks}')
+        self.instance.write(f'slist:sequence:step2:goto "{seqname}",first')
+        self.instance.write(f'slist:sequence:event:jtiming "{seqname}", immediate')
 
-            self.instance.write(f'slist:sequence:delete "{seqname}_{channel}"')
+        # for gating pulse
+        self.instance.write(f'slist:sequence:step1:goto "{seqname}", first')
+        self.instance.write(f'slist:sequence:step1:ejinput "{seqname}", ATR')
+        self.instance.write(f'slist:sequence:step1:ejump "{seqname}", 2')
+        for track, channel in enumerate(self.channels, start=1):
             self.instance.write(
-                f'slist:sequence:new "{seqname}_{channel}",2,1')
-            self.instance.write(
-                f'slist:sequence:step2:goto "{seqname}_{channel}",first'
-            )
-            self.instance.write(
-                f'slist:sequence:event:jtiming "{seqname}_{channel}" immediate'
+                f'slist:sequence:step1:tasset{track}:waveform "{seqname}","{self.wavenames[0]}_{channel}"'
             )
 
-            # for gating pulse
-            self.instance.write(
-                f'slist:sequence:step1:goto "{seqname}_{channel}", first'
-            )
-            self.instance.write(
-                f'slist:sequence:step1:ejinput "{seqname}_{channel}", ATR'
-            )
-            self.instance.write(
-                f'slist:sequence:step1:ejump "{seqname}_{channel}", 2'
-            )
-            self.instance.write(
-                f'slist:sequence:step1:tasset1:waveform "{seqname}_{channel}","{self.wavenames[0]}_{channel}"'
-            )
+        # for actual seq
+        self.instance.write(
+            f'slist:sequence:step2:rcount "{seqname}", {nongatereps}'
+        )
+        for track in range(1, tracks + 1):
+            self.instance.write(f'SLIS:SEQ:STEP2:TASS{track}:SEQ "{seqname}","sub"')
 
-            # for actual seq
+        for track, channel in enumerate(self.channels, start=1):
             self.instance.write(
-                f'slist:sequence:step2:rcount "{seqname}_{channel}", {nongatereps}'
-            )
-            self.instance.write(
-                f'slist:sequence:step2:tasset1:sequence "{seqname}_{channel}","sub_{channel}"'
-            )
-
-            self.instance.write(
-                f'source{channel}:casset:sequence "{seqname}_{channel}",1'
+                f'SOURCE{channel}:CASS:SEQUENCE "{seqname}",{track}'
             )
         self.opc_wait()
         print(colored(" [done]", "green"))
+
+    def _sequence_repeated_child(
+        self, seqname: str, logical_steps: list[AWGSequenceStep], nongatereps: int = 1
+    ) -> None:
+        prefix, child, repetitions, suffix = self._validate_repeated_child_region(
+            logical_steps
+        )
+        compact_body_steps = len(prefix) + 1 + len(suffix)
+        top_level_steps = 1 + compact_body_steps
+        print(
+            "Tek AWG sequence mode: repeated_child\n"
+            f"Expanded logical steps: {len(logical_steps)}\n"
+            f"Prefix steps: {len(prefix)}\n"
+            f"Child steps: {len(child)}\n"
+            f"Child repetitions: {repetitions}\n"
+            f"Suffix steps: {len(suffix)}\n"
+            f"Compact measurement steps: {compact_body_steps}\n"
+            f"Top-level steps: {top_level_steps}\n"
+            f"Unique waveforms: {len(set(self.wavenames))}"
+        )
+        print("Setting up sequencer".ljust(65, "."), end="")
+        # Keep waveform memory unchanged: the child is a sequence asset that
+        # references already-uploaded waveforms, not a concatenated waveform.
+        tracks = len(self.channels)
+        child_sequence = "child"
+        top_sequence = seqname
+
+        self.instance.write(f'slist:sequence:delete "{child_sequence}"')
+        self.instance.write(
+            f'slist:sequence:new "{child_sequence}",{len(child)},{tracks}'
+        )
+        self.instance.write(
+            f'slist:sequence:event:jtiming "{child_sequence}", immediate'
+        )
+        for step_index, step in enumerate(child, start=1):
+            for track, channel in enumerate(self.channels, start=1):
+                self._configure_waveform_step(
+                    child_sequence,
+                    step_index,
+                    step,
+                    channel,
+                    track,
+                    set_flags=(track == 1),
+                )
+
+        self.instance.write(f'slist:sequence:delete "{top_sequence}"')
+        self.instance.write(
+            f'slist:sequence:new "{top_sequence}",{top_level_steps},{tracks}'
+        )
+        self.instance.write(
+            f'slist:sequence:event:jtiming "{top_sequence}", immediate'
+        )
+        self.instance.write(f'slist:sequence:step1:goto "{top_sequence}", first')
+        self.instance.write(f'slist:sequence:step1:ejinput "{top_sequence}", ATR')
+        self.instance.write(f'slist:sequence:step1:ejump "{top_sequence}", 2')
+        for track, channel in enumerate(self.channels, start=1):
+            self.instance.write(
+                f'slist:sequence:step1:tasset{track}:waveform "{top_sequence}","{self.wavenames[0]}_{channel}"'
+            )
+
+        body_step = 2
+        # The top-level sequence preserves the existing trigger-wait step and
+        # then runs prefix + repeated child + suffix directly. Avoiding
+        # wrapper -> body -> child nesting keeps this compatible with AWG70000B.
+        for step in prefix:
+            for track, channel in enumerate(self.channels, start=1):
+                self._configure_waveform_step(
+                    top_sequence, body_step, step, channel, track, set_flags=(track == 1)
+                )
+            body_step += 1
+        self.instance.write(
+            f'slist:sequence:step{body_step}:rcount "{top_sequence}",{repetitions}'
+        )
+        for track in range(1, tracks + 1):
+            self.instance.write(
+                f'SLIS:SEQ:STEP{body_step}:TASS{track}:SEQ "{top_sequence}","{child_sequence}"'
+            )
+        body_step += 1
+        for step in suffix:
+            for track, channel in enumerate(self.channels, start=1):
+                self._configure_waveform_step(
+                    top_sequence, body_step, step, channel, track, set_flags=(track == 1)
+                )
+            body_step += 1
+        self.instance.write(
+            f'slist:sequence:step{top_level_steps}:goto "{top_sequence}", first'
+        )
+        for track, channel in enumerate(self.channels, start=1):
+            self.instance.write(
+                f'SOURCE{channel}:CASS:SEQUENCE "{top_sequence}",{track}'
+            )
+        self.opc_wait()
+        print(colored(" [done]", "green"))
+
+    def _configure_waveform_step(
+        self,
+        sequence_name: str,
+        step_number: int,
+        step: AWGSequenceStep,
+        channel: int,
+        track: int,
+        set_flags: bool = True,
+    ) -> None:
+        self.instance.write(
+            f'slist:sequence:step{step_number}:rcount "{sequence_name}",{step.repeat}'
+        )
+        self.instance.write(
+            f'slist:sequence:step{step_number}:tasset{track}:waveform "{sequence_name}","{step.waveform}_{channel}"'
+        )
+        if not set_flags:
+            return
+        for flag_channel in self.flag_channels:
+            flag_value = "HIGH" if flag_channel in step.flags else "LOW"
+            self.instance.write(
+                f'slist:sequence:step{step_number}:tflag1:{flag_channel}flag "{sequence_name}",{flag_value}'
+            )
+
+    def _get_awg_sequence_mode(self) -> str:
+        return str(self.sequence_options.get("awg_sequence_mode", "flat"))
+
+    def _get_logical_awg_steps(self) -> list[AWGSequenceStep]:
+        if len(self.wavenames) != len(self.seqrepeats):
+            raise ValueError(
+                "Tek AWG sequence metadata mismatch: "
+                f"{len(self.wavenames)} waveform names but "
+                f"{len(self.seqrepeats)} repeat counts."
+            )
+        steps = []
+        for wavename, repeat in zip(self.wavenames, self.seqrepeats):
+            repeat = int(repeat)
+            self._validate_awg_repeat_count(repeat, f"step {len(steps) + 1}")
+            steps.append(
+                AWGSequenceStep(
+                    waveform=str(wavename),
+                    repeat=repeat,
+                    flags=tuple(sorted(self.flag_values.get(wavename, []))),
+                )
+            )
+        return steps
+
+    def _validate_awg_repeat_count(self, repeat: int, context: str) -> None:
+        if repeat <= 0:
+            raise ValueError(f"Tek AWG {context} repeat count must be positive.")
+        if repeat > AWG_MAX_STEP_REPEAT:
+            raise ValueError(
+                f"Tek AWG {context} repeat count {repeat} exceeds the "
+                f"AWG70000B limit of {AWG_MAX_STEP_REPEAT}."
+            )
+
+    def _validate_repeated_child_region(
+        self, steps: list[AWGSequenceStep]
+    ) -> tuple[list[AWGSequenceStep], list[AWGSequenceStep], int, list[AWGSequenceStep]]:
+        config = self.sequence_options.get("awg_repeated_child", {})
+        if not isinstance(config, dict):
+            raise ValueError(
+                "awg_repeated_child must be a mapping with prefix_steps, "
+                "child_steps, and optionally repetitions."
+            )
+        try:
+            prefix_steps = int(config.get("prefix_steps", 0))
+            child_steps = int(config["child_steps"])
+        except KeyError as exc:
+            raise ValueError(
+                "awg_repeated_child requires child_steps for repeated_child mode."
+            ) from exc
+        repetitions_config = config.get("repetitions")
+        if prefix_steps < 0:
+            raise ValueError(
+                f"awg_repeated_child prefix_steps must be >= 0, got {prefix_steps}."
+            )
+        if child_steps <= 0:
+            raise ValueError(
+                f"awg_repeated_child child_steps must be > 0, got {child_steps}."
+            )
+        if child_steps > AWG_MAX_SEQUENCE_STEPS:
+            raise ValueError(
+                f"Repeated child sequence has {child_steps} steps, exceeding "
+                f"the AWG70000B limit of {AWG_MAX_SEQUENCE_STEPS}."
+            )
+        if prefix_steps + child_steps > len(steps):
+            raise ValueError(
+                "awg_repeated_child prefix_steps + child_steps exceeds the "
+                f"logical sequence length: {prefix_steps} + {child_steps} > "
+                f"{len(steps)}."
+            )
+        child = steps[prefix_steps : prefix_steps + child_steps]
+        if repetitions_config is None:
+            repetitions = self._infer_child_repetitions(steps, prefix_steps, child)
+        else:
+            repetitions = int(repetitions_config)
+            if repetitions <= 0:
+                raise ValueError(
+                    "awg_repeated_child repetitions must be > 0, got "
+                    f"{repetitions}."
+                )
+            expected_end = prefix_steps + repetitions * child_steps
+            if expected_end > len(steps):
+                raise ValueError(
+                    "awg_repeated_child prefix_steps + repetitions * child_steps "
+                    "exceeds the logical sequence length: "
+                    f"{prefix_steps} + {repetitions} * {child_steps} = "
+                    f"{expected_end} > {len(steps)}."
+                )
+            for repetition_index in range(repetitions):
+                start = prefix_steps + repetition_index * child_steps
+                current_child = steps[start : start + child_steps]
+                if current_child != child:
+                    raise ValueError(
+                        "Repeated child block mismatch at repetition "
+                        f"{repetition_index + 1}. Waveform names, repeat counts, "
+                        "and flags must match exactly for repeated_child mode."
+                    )
+        self._validate_awg_repeat_count(repetitions, "child-sequence parent")
+        suffix_start = prefix_steps + repetitions * child_steps
+        suffix = steps[suffix_start:]
+        compact_body_steps = prefix_steps + 1 + len(suffix)
+        if compact_body_steps > AWG_MAX_SEQUENCE_STEPS:
+            raise ValueError(
+                f"Compact AWG parent/body sequence has {compact_body_steps} steps, "
+                f"exceeding the AWG70000B limit of {AWG_MAX_SEQUENCE_STEPS}."
+            )
+        return steps[:prefix_steps], child, repetitions, suffix
+
+    def _infer_child_repetitions(
+        self, steps: list[AWGSequenceStep], prefix_steps: int, child: list[AWGSequenceStep]
+    ) -> int:
+        child_steps = len(child)
+        repetitions = 0
+        start = prefix_steps
+        while steps[start : start + child_steps] == child:
+            repetitions += 1
+            start += child_steps
+        if repetitions < 2:
+            raise ValueError(
+                "Could not infer awg_repeated_child repetitions: at least two "
+                "identical child occurrences are required."
+            )
+        return repetitions
+
+    def _load_awg_sequence_options(self, ps_yaml_file: Path) -> Dict[str, Any]:
+        yaml_file = Path(ps_yaml_file)
+        if not yaml_file.is_absolute():
+            yaml_file = get_seq_dir() / yaml_file
+        with open(yaml_file, "r", encoding="utf-8") as file:
+            sequence_instructions = yaml.safe_load(file)
+        return {
+            key: sequence_instructions[key]
+            for key in ("awg_sequence_mode", "awg_repeated_child")
+            if key in sequence_instructions
+        }
+
+    def _read_awg_errors(self) -> list[str]:
+        errors = []
+        while True:
+            response = str(self.instance.query("SYSTEM:ERROR?")).strip()
+            code_text, _, message = response.partition(",")
+            try:
+                code = int(code_text)
+            except ValueError:
+                errors.append(response)
+                break
+            if code == 0:
+                break
+            errors.append(f"{code},{message}".rstrip(","))
+        return errors
+
+    def _raise_on_awg_errors(self, context: str) -> None:
+        errors = self._read_awg_errors()
+        if errors:
+            raise RuntimeError(
+                f"Tektronix AWG reported errors during {context}: "
+                + "; ".join(errors)
+            )
 
     def _load_sequence_block(self, seqname: Path) -> None:
         block = np.load(seqname)
@@ -432,6 +732,21 @@ class AWGenerator(VisaObject, Synchroniser):
 
     def _set_channels_attribute(self, channels: list[int]) -> None:
         self.channels = channels
+
+    def _limit_channels_to_available_outputs(self) -> None:
+        try:
+            identity = str(self.instance.query("*IDN?"))
+        except Exception:
+            return
+        if "AWG70001" in identity and self.channels != [1]:
+            # AWG70001B is a single-output model. Sending SOURCE2 commands raises
+            # SCPI header errors, so restrict waveform generation/upload as well
+            # as sequence assignment to the available output.
+            print("Detected single-channel Tektronix AWG70001; using channel 1 only.")
+            logging.warning(
+                "Detected single-channel Tektronix AWG70001; using channel 1 only."
+            )
+            self.channels = [1]
 
     def plot_waveform(self, wavename: str) -> None:
         """

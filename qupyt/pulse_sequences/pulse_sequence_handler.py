@@ -7,6 +7,9 @@ import importlib.util
 from types import ModuleType
 from pathlib import Path
 from typing import Dict, Any, Optional, Protocol, cast
+import yaml
+
+from qupyt.set_up import get_seq_dir
 
 
 # pylint: disable=too-few-public-methods
@@ -46,9 +49,48 @@ def write_user_ps(path: Path, params: Dict[str, Any]) -> Optional[Dict[str, Any]
     Load user specified pulse sequence definition and
     execute it to generate the pulse sequence.
     """
+    sequence_dir = get_seq_dir()
+    previous_sequence_files = {
+        sequence_file: sequence_file.stat().st_mtime_ns
+        for sequence_file in sequence_dir.glob("sequence_*.yaml")
+    }
     user_ps = cast(UserPulseSeqProtocol, _load_module_from_path(path))
     dependent_parameters = user_ps.generate_sequence(params)
+    _copy_awg_sequence_options(params, previous_sequence_files)
     return dependent_parameters
+
+
+def _copy_awg_sequence_options(
+    params: Dict[str, Any], previous_sequence_files: Dict[Path, int]
+) -> None:
+    """Copy Tek-only upload options into generated sequence YAML files.
+
+    User pulse-sequence functions only receive params["pulse_sequence"] and write
+    sequence_*.yaml files. The Tek AWG backend reads those generated files, not
+    the outer measurement instruction file, so opt-in AWG upload settings have to
+    travel with the generated pulse sequence.
+    """
+
+    awg_options = {
+        key: params[key]
+        for key in ("awg_sequence_mode", "awg_repeated_child")
+        if key in params
+    }
+    if not awg_options:
+        return
+
+    generated_sequence_files = [
+        sequence_file
+        for sequence_file in get_seq_dir().glob("sequence_*.yaml")
+        if previous_sequence_files.get(sequence_file) != sequence_file.stat().st_mtime_ns
+    ]
+
+    for sequence_file in generated_sequence_files:
+        with open(sequence_file, "r", encoding="utf-8") as file:
+            sequence_yaml = yaml.safe_load(file)
+        sequence_yaml.update(awg_options)
+        with open(sequence_file, "w", encoding="utf-8") as file:
+            yaml.dump(sequence_yaml, file)
 
 
 def update_params_dict(
