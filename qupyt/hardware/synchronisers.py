@@ -44,6 +44,9 @@ except (ImportError, NameError):
     )
 
 
+# Default AWG70000B sequencer limits. AWG/Mock synchroniser configs can
+# override these with awg_max_sequence_steps / awg_max_step_repeat for other
+# AWG models; pulse-sequence YAML should not define hardware limits.
 AWG_MAX_SEQUENCE_STEPS = 16_384
 AWG_MAX_STEP_REPEAT = 1_048_576
 
@@ -59,6 +62,54 @@ class AWGSequenceStep:
     waveform: str
     repeat: int
     flags: tuple[str, ...]
+
+
+def _check_awg_sequence_mode_supported(
+    sequence_instructions: Dict[str, Any],
+    device_type: str,
+    supported_modes: tuple[str, ...],
+) -> str:
+    """Validate optional Tek AWG upload metadata for a synchroniser.
+
+    awg_sequence_mode is not part of the logical pulse program. It only
+    describes how TekAWG should upload that pulse program. Non-AWG devices
+    reject unsupported modes explicitly so a Tek-only YAML option is not
+    silently ignored.
+    """
+
+    mode = str(sequence_instructions.get("awg_sequence_mode", "flat"))
+    if mode not in supported_modes:
+        message = (
+            f"awg_sequence_mode: {mode} is not supported by {device_type}. "
+            f"Supported modes for {device_type}: {', '.join(supported_modes)}."
+        )
+        logging.error(message)
+        raise ValueError(message)
+    logging.info(
+        "%s accepted awg_sequence_mode=%s", device_type, mode
+    )
+    return mode
+
+
+def _validate_awg_limit(value: Any, key: str, device_type: str) -> int:
+    """Validate an AWG hardware limit from synchroniser.config.
+
+    Defaults are assigned in the synchroniser __init__; this helper is only
+    called when the YAML provides an override for another AWG model.
+    """
+
+    try:
+        limit = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{key} must be an integer AWG limit for {device_type}, got {value!r}."
+        ) from exc
+    if limit <= 0:
+        raise ValueError(
+            f"{key} must be a positive AWG limit for {device_type}, got {limit}."
+        )
+    logging.info("%s configured %s=%s", device_type, key, limit)
+    return limit
 
 
 class SynchroniserFactory:
@@ -197,7 +248,10 @@ class Synchroniser(ABC, ConfigurationMixin):
 
 class AWGenerator(VisaObject, Synchroniser):
     """
-    Synchroniser implementation for the Tektronix AWG 5000 series.
+    Synchroniser implementation for Tektronix AWGs.
+
+    Flat mode preserves the existing Tek AWG behavior. repeated_child mode uses
+    Tek AWG70000-series sequence-asset SCPI and was tested on AWG70001B.
     """
 
     def __init__(
@@ -217,11 +271,17 @@ class AWGenerator(VisaObject, Synchroniser):
         self.dac_resolution: int = 12
         self.channels: list[int] = [1, 2]
         self.marker_channels: list[int] = [1, 2, 3, 4]
+        self.awg_max_sequence_steps: int = AWG_MAX_SEQUENCE_STEPS
+        self.awg_max_step_repeat: int = AWG_MAX_STEP_REPEAT
 
         Synchroniser.__init__(self)
         self.attribute_map["device_type"] = self._set_device_type
         self.attribute_map["sampling_rate"] = self._set_sampling_rate_attribute
         self.attribute_map["channels"] = self._set_channels_attribute
+        self.attribute_map["awg_max_sequence_steps"] = (
+            self._set_awg_max_sequence_steps
+        )
+        self.attribute_map["awg_max_step_repeat"] = self._set_awg_max_step_repeat
         if configuration is not None:
             self._update_from_configuration(configuration)
         VisaObject.__init__(self, self.address, self.device_type)
@@ -313,6 +373,7 @@ class AWGenerator(VisaObject, Synchroniser):
             self._sequence_flat(seqname, logical_steps, nongatereps=nongatereps)
             return
         if mode == "repeated_child":
+            self._raise_if_repeated_child_is_unverified_model()
             self._sequence_repeated_child(
                 seqname, logical_steps, nongatereps=nongatereps
             )
@@ -325,13 +386,15 @@ class AWGenerator(VisaObject, Synchroniser):
     def _sequence_flat(
         self, seqname: str, logical_steps: list[AWGSequenceStep], nongatereps: int = 1
     ) -> None:
-        if len(logical_steps) > AWG_MAX_SEQUENCE_STEPS:
+        if len(logical_steps) > self.awg_max_sequence_steps:
             raise ValueError(
                 f"Expanded AWG sequence has {len(logical_steps)} steps, exceeding "
-                f"the AWG70000B limit of {AWG_MAX_SEQUENCE_STEPS}. Enable "
+                f"the configured AWG limit of {self.awg_max_sequence_steps}. Enable "
                 "awg_sequence_mode: repeated_child or reduce the sequence."
         )
-        print(f"Tek AWG sequence mode: flat\nLogical steps: {len(logical_steps)}")
+        summary = f"Tek AWG sequence mode: flat\nLogical steps: {len(logical_steps)}"
+        print(summary)
+        logging.info("Tek AWG sequence mode: flat; logical_steps=%s", len(logical_steps))
         print("Setting up sequencer".ljust(65, "."), end="")
         # AWG70K sequence assets have one or more tracks. Each active AWG output
         # is assigned one track of the same sequence asset via SOURCE:CASS.
@@ -376,12 +439,15 @@ class AWGenerator(VisaObject, Synchroniser):
     def _sequence_repeated_child(
         self, seqname: str, logical_steps: list[AWGSequenceStep], nongatereps: int = 1
     ) -> None:
+        # This parent/child sequencer upload uses Tek AWG70000-series SCPI and
+        # was tested on TEKTRONIX AWG70001B firmware FV:8.1.0266.0. Similar Tek
+        # models should be verified before enabling repeated_child in the lab.
         prefix, child, repetitions, suffix = self._validate_repeated_child_region(
             logical_steps
         )
         compact_body_steps = len(prefix) + 1 + len(suffix)
         top_level_steps = 1 + compact_body_steps
-        print(
+        summary = (
             "Tek AWG sequence mode: repeated_child\n"
             f"Expanded logical steps: {len(logical_steps)}\n"
             f"Prefix steps: {len(prefix)}\n"
@@ -391,6 +457,21 @@ class AWGenerator(VisaObject, Synchroniser):
             f"Compact measurement steps: {compact_body_steps}\n"
             f"Top-level steps: {top_level_steps}\n"
             f"Unique waveforms: {len(set(self.wavenames))}"
+        )
+        print(summary)
+        logging.info(
+            "Tek AWG sequence mode: repeated_child; expanded_logical_steps=%s; "
+            "prefix_steps=%s; child_steps=%s; child_repetitions=%s; "
+            "suffix_steps=%s; compact_measurement_steps=%s; top_level_steps=%s; "
+            "unique_waveforms=%s",
+            len(logical_steps),
+            len(prefix),
+            len(child),
+            repetitions,
+            len(suffix),
+            compact_body_steps,
+            top_level_steps,
+            len(set(self.wavenames)),
         )
         print("Setting up sequencer".ljust(65, "."), end="")
         # Keep waveform memory unchanged: the child is a sequence asset that
@@ -515,10 +596,10 @@ class AWGenerator(VisaObject, Synchroniser):
     def _validate_awg_repeat_count(self, repeat: int, context: str) -> None:
         if repeat <= 0:
             raise ValueError(f"Tek AWG {context} repeat count must be positive.")
-        if repeat > AWG_MAX_STEP_REPEAT:
+        if repeat > self.awg_max_step_repeat:
             raise ValueError(
                 f"Tek AWG {context} repeat count {repeat} exceeds the "
-                f"AWG70000B limit of {AWG_MAX_STEP_REPEAT}."
+                f"configured AWG limit of {self.awg_max_step_repeat}."
             )
 
     def _validate_repeated_child_region(
@@ -546,10 +627,10 @@ class AWGenerator(VisaObject, Synchroniser):
             raise ValueError(
                 f"awg_repeated_child child_steps must be > 0, got {child_steps}."
             )
-        if child_steps > AWG_MAX_SEQUENCE_STEPS:
+        if child_steps > self.awg_max_sequence_steps:
             raise ValueError(
                 f"Repeated child sequence has {child_steps} steps, exceeding "
-                f"the AWG70000B limit of {AWG_MAX_SEQUENCE_STEPS}."
+                f"the configured AWG limit of {self.awg_max_sequence_steps}."
             )
         if prefix_steps + child_steps > len(steps):
             raise ValueError(
@@ -569,11 +650,19 @@ class AWGenerator(VisaObject, Synchroniser):
                 )
             expected_end = prefix_steps + repetitions * child_steps
             if expected_end > len(steps):
+                available_steps = len(steps) - prefix_steps
+                max_complete_repetitions = available_steps // child_steps
                 raise ValueError(
-                    "awg_repeated_child prefix_steps + repetitions * child_steps "
-                    "exceeds the logical sequence length: "
+                    "awg_repeated_child does not match the expanded logical "
+                    "sequence. The configured repeated region would end after "
                     f"{prefix_steps} + {repetitions} * {child_steps} = "
-                    f"{expected_end} > {len(steps)}."
+                    f"{expected_end} steps, but the generated sequence has only "
+                    f"{len(steps)} steps. After the {prefix_steps} prefix steps, "
+                    f"only {available_steps} steps remain, which can contain at "
+                    f"most {max_complete_repetitions} complete child repetitions "
+                    f"of {child_steps} steps. Check that n_meas/repetitions and "
+                    "len(cycle_order)/child_steps are calculated from the same "
+                    "sequence that is written to sequencing_order."
                 )
             for repetition_index in range(repetitions):
                 start = prefix_steps + repetition_index * child_steps
@@ -588,10 +677,10 @@ class AWGenerator(VisaObject, Synchroniser):
         suffix_start = prefix_steps + repetitions * child_steps
         suffix = steps[suffix_start:]
         compact_body_steps = prefix_steps + 1 + len(suffix)
-        if compact_body_steps > AWG_MAX_SEQUENCE_STEPS:
+        if compact_body_steps > self.awg_max_sequence_steps:
             raise ValueError(
                 f"Compact AWG parent/body sequence has {compact_body_steps} steps, "
-                f"exceeding the AWG70000B limit of {AWG_MAX_SEQUENCE_STEPS}."
+                f"exceeding the configured AWG limit of {self.awg_max_sequence_steps}."
             )
         return steps[:prefix_steps], child, repetitions, suffix
 
@@ -733,20 +822,82 @@ class AWGenerator(VisaObject, Synchroniser):
     def _set_channels_attribute(self, channels: list[int]) -> None:
         self.channels = channels
 
+    def _set_awg_max_sequence_steps(self, max_sequence_steps: int) -> None:
+        self.awg_max_sequence_steps = _validate_awg_limit(
+            max_sequence_steps,
+            "awg_max_sequence_steps",
+            "Tek AWG",
+        )
+
+    def _set_awg_max_step_repeat(self, max_step_repeat: int) -> None:
+        self.awg_max_step_repeat = _validate_awg_limit(
+            max_step_repeat,
+            "awg_max_step_repeat",
+            "Tek AWG",
+        )
+
     def _limit_channels_to_available_outputs(self) -> None:
         try:
-            identity = str(self.instance.query("*IDN?"))
+            identity = self._query_awg_identity()
         except Exception:
             return
-        if "AWG70001" in identity and self.channels != [1]:
-            # AWG70001B is a single-output model. Sending SOURCE2 commands raises
-            # SCPI header errors, so restrict waveform generation/upload as well
-            # as sequence assignment to the available output.
-            print("Detected single-channel Tektronix AWG70001; using channel 1 only.")
-            logging.warning(
-                "Detected single-channel Tektronix AWG70001; using channel 1 only."
+        available_channels = self._detect_awg70000_available_channels(identity)
+        if available_channels is None:
+            return
+        usable_channels = [
+            channel for channel in self.channels if channel in available_channels
+        ]
+        if not usable_channels:
+            raise ValueError(
+                "Configured Tek AWG channels do not match the detected "
+                f"AWG70000-series outputs. channels={self.channels}, "
+                f"available_channels={available_channels}, idn={identity.strip()!r}."
             )
-            self.channels = [1]
+        if usable_channels != self.channels:
+            message = (
+                "Restricting Tek AWG channels to detected AWG70000-series "
+                f"outputs: requested {self.channels}, available "
+                f"{available_channels}, using {usable_channels}, "
+                f"idn={identity.strip()!r}."
+            )
+            print(message)
+            logging.warning(message)
+            self.channels = usable_channels
+
+    def _detect_awg70000_available_channels(self, identity: str) -> list[int] | None:
+        """Return available output channels for known Tek AWG70000-series models.
+
+        The AWG70001 is single-output, while AWG70002 models have two outputs.
+        For unknown models, return None and leave the user-configured channels
+        unchanged instead of guessing hardware capabilities.
+        """
+
+        if "AWG70001" in identity:
+            return [1]
+        if "AWG70002" in identity:
+            return [1, 2]
+        return None
+
+    def _query_awg_identity(self) -> str:
+        return str(self.instance.query("*IDN?"))
+
+    def _raise_if_repeated_child_is_unverified_model(self) -> None:
+        try:
+            identity = self._query_awg_identity()
+        except Exception:
+            return
+        if "AWG5202" in identity:
+            message = (
+                "awg_sequence_mode: repeated_child is not enabled for detected "
+                f"AWG model {identity.strip()!r}. The current repeated_child "
+                "SCPI path was tested on TEKTRONIX AWG70001B and uses "
+                "AWG70000-series sequence asset/track commands. AWG5202 may be "
+                "similar, but it must be verified with the programming manual "
+                "or a hardware test before this guard is removed. Use flat mode "
+                "on AWG5202 for now."
+            )
+            logging.error(message)
+            raise ValueError(message)
 
     def plot_waveform(self, wavename: str) -> None:
         """
@@ -1013,6 +1164,11 @@ class PStreamer(Synchroniser):
             self.yaml_file = set_up.get_seq_dir() / ps_yaml_file
             with open(self.yaml_file, "r", encoding="utf-8") as file:
                 full_pulse_list = yaml.load(file, Loader=yaml.FullLoader)
+            # PulseStreamer consumes the expanded pulse program directly; it
+            # does not implement Tek AWG parent/child sequencer compression.
+            _check_awg_sequence_mode_supported(
+                full_pulse_list, "PulseStreamer", ("flat",)
+            )
             sequence_order = full_pulse_list["sequencing_order"]
             sequencing_repeats = full_pulse_list["sequencing_repeats"]
 
@@ -1113,8 +1269,14 @@ class MockGenerator(Synchroniser):
     def __init__(self, configuration: Dict[str, Any], channel_mapping: Dict[str, Any]):
         self.channel_mapping = channel_mapping
         self.device_type: str = "MockGenerator"
+        self.awg_max_sequence_steps: int = AWG_MAX_SEQUENCE_STEPS
+        self.awg_max_step_repeat: int = AWG_MAX_STEP_REPEAT
 
         Synchroniser.__init__(self)
+        self.attribute_map["awg_max_sequence_steps"] = (
+            self._set_awg_max_sequence_steps
+        )
+        self.attribute_map["awg_max_step_repeat"] = self._set_awg_max_step_repeat
         self.initial_configuration_dict = configuration
         if configuration is not None:
             self._update_from_configuration(configuration)
@@ -1138,8 +1300,17 @@ class MockGenerator(Synchroniser):
             total_duration = (
                 float(full_pulse_list["total_duration"]) * 1e3
             )  # convert to ns
-            _ = full_pulse_list["sequencing_order"]
-            _ = full_pulse_list["sequencing_repeats"]
+            sequence_order = full_pulse_list["sequencing_order"]
+            sequencing_repeats = full_pulse_list["sequencing_repeats"]
+            # Mock accepts repeated_child as a dry run of the Tek AWG upload
+            # strategy. It validates the metadata but still has no hardware
+            # sequencer to program.
+            _check_awg_sequence_mode_supported(
+                full_pulse_list, "MockSynchroniser", ("flat", "repeated_child")
+            )
+            self._validate_awg_sequence_options(
+                full_pulse_list, sequence_order, sequencing_repeats
+            )
             if total_duration - round(total_duration) != 0:
                 logging.warning(
                     "Warning: The total duration is not multiple of the sampling time and is being rounded!"
@@ -1157,6 +1328,199 @@ class MockGenerator(Synchroniser):
             logging.exception(
                 "Caught attribute error when writing loading from yaml pulse sequence"
             )
+
+    def _validate_awg_sequence_options(
+        self,
+        full_pulse_list: Dict[str, Any],
+        sequence_order: List[str],
+        sequencing_repeats: List[int],
+    ) -> None:
+        """Dry-run TekAWG sequence-mode metadata for mock measurements.
+
+        The mock does not send SCPI commands or compress waveforms. It checks
+        that the expanded logical sequence can be represented by the configured
+        repeated_child parent/child layout, so mock measurements catch the same
+        configuration mistakes before the YAML is sent to a real AWG.
+        """
+
+        mode = str(full_pulse_list.get("awg_sequence_mode", "flat"))
+        if mode == "flat":
+            logging.info("MockSynchroniser AWG sequence mode: flat")
+            return
+        if mode != "repeated_child":
+            raise ValueError(
+                f"Unsupported awg_sequence_mode for MockSynchroniser: {mode!r}. "
+                "Supported values are 'flat' and 'repeated_child'."
+            )
+
+        if len(sequence_order) != len(sequencing_repeats):
+            raise ValueError(
+                "MockSynchroniser sequence metadata mismatch: "
+                f"{len(sequence_order)} sequence entries but "
+                f"{len(sequencing_repeats)} repeat counts."
+            )
+
+        previous_options = getattr(self, "sequence_options", {})
+        self.sequence_options = {
+            key: full_pulse_list[key]
+            for key in ("awg_sequence_mode", "awg_repeated_child")
+            if key in full_pulse_list
+        }
+        try:
+            logical_steps = []
+            for block, repeat in zip(sequence_order, sequencing_repeats):
+                repeat = int(repeat)
+                self._validate_awg_repeat_count(repeat, f"step {len(logical_steps) + 1}")
+                logical_steps.append(AWGSequenceStep(str(block), repeat, ()))
+            prefix, child, repetitions, suffix = self._validate_repeated_child_region(
+                logical_steps
+            )
+        finally:
+            self.sequence_options = previous_options
+
+        summary = (
+            "MockSynchroniser AWG sequence mode: repeated_child\n"
+            f"Expanded logical steps: {len(logical_steps)}\n"
+            f"Prefix steps: {len(prefix)}\n"
+            f"Child steps: {len(child)}\n"
+            f"Child repetitions: {repetitions}\n"
+            f"Suffix steps: {len(suffix)}"
+        )
+        print(summary)
+        logging.info(
+            "MockSynchroniser AWG sequence mode: repeated_child; "
+            "expanded_logical_steps=%s; prefix_steps=%s; child_steps=%s; "
+            "child_repetitions=%s; suffix_steps=%s",
+            len(logical_steps),
+            len(prefix),
+            len(child),
+            repetitions,
+            len(suffix),
+        )
+
+    def _validate_awg_repeat_count(self, repeat: int, context: str) -> None:
+        if repeat <= 0:
+            raise ValueError(f"MockSynchroniser AWG {context} repeat count must be positive.")
+        if repeat > self.awg_max_step_repeat:
+            raise ValueError(
+                f"MockSynchroniser AWG {context} repeat count {repeat} exceeds "
+                f"the configured AWG limit of {self.awg_max_step_repeat}."
+            )
+
+    def _set_awg_max_sequence_steps(self, max_sequence_steps: int) -> None:
+        self.awg_max_sequence_steps = _validate_awg_limit(
+            max_sequence_steps,
+            "awg_max_sequence_steps",
+            "MockSynchroniser",
+        )
+
+    def _set_awg_max_step_repeat(self, max_step_repeat: int) -> None:
+        self.awg_max_step_repeat = _validate_awg_limit(
+            max_step_repeat,
+            "awg_max_step_repeat",
+            "MockSynchroniser",
+        )
+
+    def _validate_repeated_child_region(
+        self, steps: list[AWGSequenceStep]
+    ) -> tuple[list[AWGSequenceStep], list[AWGSequenceStep], int, list[AWGSequenceStep]]:
+        config = self.sequence_options.get("awg_repeated_child", {})
+        if not isinstance(config, dict):
+            raise ValueError(
+                "awg_repeated_child must be a mapping with prefix_steps, "
+                "child_steps, and optionally repetitions."
+            )
+        try:
+            prefix_steps = int(config.get("prefix_steps", 0))
+            child_steps = int(config["child_steps"])
+        except KeyError as exc:
+            raise ValueError(
+                "awg_repeated_child requires child_steps for repeated_child mode."
+            ) from exc
+
+        repetitions_config = config.get("repetitions")
+        if prefix_steps < 0:
+            raise ValueError(
+                f"awg_repeated_child prefix_steps must be >= 0, got {prefix_steps}."
+            )
+        if child_steps <= 0:
+            raise ValueError(
+                f"awg_repeated_child child_steps must be > 0, got {child_steps}."
+            )
+        if child_steps > self.awg_max_sequence_steps:
+            raise ValueError(
+                f"Repeated child sequence has {child_steps} steps, exceeding "
+                f"the configured AWG limit of {self.awg_max_sequence_steps}."
+            )
+        if prefix_steps + child_steps > len(steps):
+            raise ValueError(
+                "awg_repeated_child prefix_steps + child_steps exceeds the "
+                f"logical sequence length: {prefix_steps} + {child_steps} > "
+                f"{len(steps)}."
+            )
+
+        child = steps[prefix_steps : prefix_steps + child_steps]
+        if repetitions_config is None:
+            repetitions = self._infer_child_repetitions(steps, prefix_steps, child)
+        else:
+            repetitions = int(repetitions_config)
+            if repetitions <= 0:
+                raise ValueError(
+                    "awg_repeated_child repetitions must be > 0, got "
+                    f"{repetitions}."
+                )
+            expected_end = prefix_steps + repetitions * child_steps
+            if expected_end > len(steps):
+                available_steps = len(steps) - prefix_steps
+                max_complete_repetitions = available_steps // child_steps
+                raise ValueError(
+                    "awg_repeated_child does not match the expanded logical "
+                    "sequence. The configured repeated region would end after "
+                    f"{prefix_steps} + {repetitions} * {child_steps} = "
+                    f"{expected_end} steps, but the generated sequence has only "
+                    f"{len(steps)} steps. After the {prefix_steps} prefix steps, "
+                    f"only {available_steps} steps remain, which can contain at "
+                    f"most {max_complete_repetitions} complete child repetitions "
+                    f"of {child_steps} steps. Check that n_meas/repetitions and "
+                    "len(cycle_order)/child_steps are calculated from the same "
+                    "sequence that is written to sequencing_order."
+                )
+            for repetition_index in range(repetitions):
+                start = prefix_steps + repetition_index * child_steps
+                current_child = steps[start : start + child_steps]
+                if current_child != child:
+                    raise ValueError(
+                        "Repeated child block mismatch at repetition "
+                        f"{repetition_index + 1}. Sequence names and repeat "
+                        "counts must match exactly for repeated_child mode."
+                    )
+
+        self._validate_awg_repeat_count(repetitions, "child-sequence parent")
+        suffix_start = prefix_steps + repetitions * child_steps
+        suffix = steps[suffix_start:]
+        compact_body_steps = prefix_steps + 1 + len(suffix)
+        if compact_body_steps > self.awg_max_sequence_steps:
+            raise ValueError(
+                f"Compact AWG parent/body sequence has {compact_body_steps} steps, "
+                f"exceeding the configured AWG limit of {self.awg_max_sequence_steps}."
+            )
+        return steps[:prefix_steps], child, repetitions, suffix
+
+    def _infer_child_repetitions(
+        self, steps: list[AWGSequenceStep], prefix_steps: int, child: list[AWGSequenceStep]
+    ) -> int:
+        child_steps = len(child)
+        repetitions = 0
+        start = prefix_steps
+        while steps[start : start + child_steps] == child:
+            repetitions += 1
+            start += child_steps
+        if repetitions < 2:
+            raise ValueError(
+                "Could not infer awg_repeated_child repetitions: at least two "
+                "identical child occurrences are required."
+            )
+        return repetitions
 
     def run(self) -> None:
         logging.info("Sent run to MockSynchroniser".ljust(65, ".") + "[done]")
@@ -1263,6 +1627,15 @@ class PulseBlaster(Synchroniser):
         self.configure_pb()
 
     def load_sequence(self, ps_yaml_file: str = "sequence_0.yaml") -> None:
+        yaml_file = Path(ps_yaml_file)
+        if not yaml_file.is_absolute():
+            yaml_file = get_seq_dir() / yaml_file
+        with open(yaml_file, "r", encoding="utf-8") as file:
+            # PulseBlaster also consumes the expanded program directly. Keep
+            # Tek-only upload modes out of this path with a clear error.
+            _check_awg_sequence_mode_supported(
+                yaml.safe_load(file) or {}, "PulseBlaster", ("flat",)
+            )
         yaml_sequence_transpiler = PulseBlasterSequence(self.channel_mapping, ps_yaml_file)
         yaml_sequence_transpiler.parse_pulse_sequence_file()
         channel_bit_mask, pulse_duration_list = yaml_sequence_transpiler.compile()
